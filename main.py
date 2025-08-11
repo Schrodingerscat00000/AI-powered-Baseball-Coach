@@ -393,24 +393,73 @@ def parse_format(text: str):
 
 
 def detect_download_intent(text: str):
+    """
+    More conservative download intent detector:
+    - Requires an explicit download/export/send-file verb (or explicit format like csv/xlsx)
+      OR a clear phrase like 'send me a copy' / 'give me a file'.
+    - If the message looks like an analysis request (analyze/show/summarize/insights),
+      we do NOT treat it as a download unless the user also used a download verb.
+    - If both analysis and download verbs are present, we return 'ambiguous' so the chat can clarify.
+    """
     t = text.lower()
-    # trigger verbs or nouns
-    if not (re.search(r"\b(download|export|send|give|get|retrieve|downloadable|send me)\b", t)
-            or re.search(r"\b(data|logs|log|csv|report|history|records)\b", t)):
+
+    # strong download verbs / phrases
+    download_verbs = re.compile(
+        r"\b(download|download a copy|download copy|export|export as|send (me )?(a )?(copy|file|csv|excel|spreadsheet)|"
+        r"give (me )?(a )?(copy|file)|get (me )?(a )?(copy|file)|save (a )?(copy|file)|send (the )?file)\b"
+    )
+
+    # explicit file/format mentions (csv/xlsx/json) — can act as download hint but only if paired with a verb
+    format_words = re.compile(r"\b(csv|excel|xlsx|spreadsheet|file|copy|downloadable)\b")
+
+    # analysis / view intent words (we want these to prevent false downloads)
+    analysis_words = re.compile(r"\b(analyz(e|is|ing)|analyze|analysis|show( me)?|summar(y|ize|ising|izing)|insight(s)?|plot|visuali[sz]e|chart|compare|how|what)\b")
+
+    has_download_verb = bool(download_verbs.search(t))
+    has_format = bool(format_words.search(t))
+    has_analysis = bool(analysis_words.search(t))
+
+    # If message clearly analytic and no download verb -> not a download
+    if has_analysis and not has_download_verb:
         return None
 
-    start, end, preset = parse_dates_from_text(t)
-    sections = parse_sections(t)
-    fmt = parse_format(t)
-    return {
-        "intent": "download_data",
-        "preset": preset,
-        "start": start.isoformat() if start else None,
-        "end": end.isoformat() if end else None,
-        "sections": sections,
-        "format": fmt,
-        "raw_text": text
-    }
+    # If there's a download verb -> proceed (we will parse slots)
+    if has_download_verb:
+        start, end, preset = parse_dates_from_text(t)
+        sections = parse_sections(t)
+        fmt = parse_format(t)
+        return {
+            "intent": "download_data",
+            "preset": preset,
+            "start": start.isoformat() if start else None,
+            "end": end.isoformat() if end else None,
+            "sections": sections,
+            "format": fmt,
+            "raw_text": text
+        }
+
+    # If no download verb but explicit format phrase (e.g., "csv for last 30 days"), treat as download only if not analytic
+    if has_format and not has_analysis:
+        start, end, preset = parse_dates_from_text(t)
+        sections = parse_sections(t)
+        fmt = parse_format(t)
+        return {
+            "intent": "download_data",
+            "preset": preset,
+            "start": start.isoformat() if start else None,
+            "end": end.isoformat() if end else None,
+            "sections": sections,
+            "format": fmt,
+            "raw_text": text
+        }
+
+    # If both analysis and download verb present, return ambiguous so chat can clarify
+    if has_analysis and has_download_verb:
+        return {"intent":"ambiguous_download_vs_analysis", "raw_text": text}
+
+    # otherwise not a download
+    return None
+
 
 
 # ─── Chat Endpoint ──────────────────────────────────────────────────────────
@@ -422,6 +471,13 @@ def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     # --------- improved download intent handling ----------
     intent = detect_download_intent(text)
     if intent:
+        # ambiguous case: user asked both "analyze" and "download"
+        if intent.get("intent") == "ambiguous_download_vs_analysis":
+            return {
+                "tag": "clarify_download_vs_analysis",
+                "reply": "Do you want a downloadable file of your logs, or would you like me to analyze/summarize them here in chat?"
+                # optionally include quick-reply buttons: ["Download", "Analyze"]
+            }
         # fill user id
         intent["user_id"] = req.userId
 
